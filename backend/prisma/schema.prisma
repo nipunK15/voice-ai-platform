@@ -1,0 +1,167 @@
+// prisma/schema.prisma
+// Defines the database schema for the Voice AI Platform.
+// We use PostgreSQL as the primary database — it's production-grade,
+// supports JSON columns for flexible message storage, and works with Prisma ORM.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// User model — placeholder auth for MVP.
+// In production: replace with Clerk/Auth0 integration.
+// The `apiKey` field allows developers to authenticate with the platform API,
+// mimicking how Vapi uses API keys for developer access.
+model User {
+  id        String   @id @default(uuid())
+  email     String   @unique
+  name      String
+  apiKey    String   @unique @default(uuid()) // Developer API key
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  agents        Agent[]
+  conversations Conversation[]
+
+  @@map("users")
+}
+
+// Agent model — the core entity of the platform.
+// Each agent represents a configurable voice persona.
+// This mirrors Vapi's "assistant" concept but owned by our platform.
+//
+// PROMPT ARCHITECTURE — single layer → multi layer
+//
+//   prompt              (KEPT)   — original single field; still populated for all
+//                                  existing agents; used as fallback when new fields
+//                                  are absent. DO NOT remove until all agents are
+//                                  migrated and the field is explicitly deprecated.
+//
+//   systemPrompt        (NEW)    — replaces prompt long-term.
+//                                  Who the agent is; its identity, rules, and
+//                                  constraints. Maps to the "system" message that
+//                                  opens every conversation.
+//
+//   conversationPrompt  (NEW)    — How the agent should behave during a conversation:
+//                                  tone, pacing, turn-taking, clarification style.
+//                                  Injected into the compiled prompt below systemPrompt.
+//
+//   taskPrompt          (NEW)    — What the agent is trying to accomplish in this
+//                                  session: current goal, success criteria, scope.
+//                                  Sits below conversationPrompt so it is always
+//                                  the freshest instruction the model reads.
+//
+//   memoryInstructions  (NEW)    — How the agent should handle things it remembers:
+//                                  what to surface, what to ignore, how to reference
+//                                  past sessions. Consumed by the context layer.
+//
+//   toolInstructions    (NEW)    — Rules for when and how to invoke tools/functions.
+//                                  Placeholder for the tool orchestration layer;
+//                                  safe to leave null until that layer is built.
+//
+// All five new fields are optional (nullable) so existing rows require no immediate
+// data migration — the backend falls back to `prompt` when they are null.
+model Agent {
+  id            String   @id @default(uuid())
+  name          String
+
+  // ── Legacy prompt (keep until full migration complete) ───────────────────
+  prompt        String   @db.Text // Original single prompt — DO NOT DROP YET
+
+  // ── Multi-layer prompt fields (all nullable for backward compatibility) ──
+  systemPrompt        String?  @db.Text // Layer 1: identity + rules
+  conversationPrompt  String?  @db.Text // Layer 2: tone + behaviour
+  taskPrompt          String?  @db.Text // Layer 3: current goal
+  memoryInstructions  String?  @db.Text // Layer 4: how to use remembered context
+  toolInstructions    String?  @db.Text // Layer 5: function/tool usage rules
+
+  personality   String   @default("professional") // e.g. friendly, professional, casual
+  voiceProvider String   @default("11labs")        // deepgram, 11labs, azure, openai
+  voiceId       String   @default("rachel")        // Provider-specific voice ID
+  temperature   Float    @default(0.7)             // LLM temperature (0.0 - 1.0)
+  vapiAgentId   String?                            // Vapi's assistant ID (set after Vapi sync)
+  isActive      Boolean  @default(true)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+  
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  flowDefinition  Json?   // the orchestration flow config
+
+
+  conversations Conversation[]
+
+  @@map("agents")
+}
+
+// Conversation model — stores each voice session.
+// A conversation belongs to an agent and holds metadata about the call.
+// In Vapi terms, this is a "call" object. We normalize it into our own schema
+// so we're not fully locked into Vapi's data model.
+model Conversation {
+  id         String    @id @default(uuid())
+  agentId    String
+  agent      Agent     @relation(fields: [agentId], references: [id], onDelete: Cascade)
+  userId     String
+  user       User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  vapiCallId String?                    // Vapi's call ID for reference
+  status     String    @default("active") // active | completed | failed
+  duration   Int?                       // Duration in seconds
+  startedAt  DateTime  @default(now())
+  endedAt    DateTime?
+  summary    String?   @db.Text         // AI-generated conversation summary
+  createdAt  DateTime  @default(now())
+  updatedAt  DateTime  @updatedAt
+  stages          ConversationStage[]
+  snapshot        OrchestrationSnapshot?
+
+  messages Message[]
+
+  @@map("conversations")
+}
+
+// Message model — individual turns in a conversation.
+// Stores both user and assistant messages for full conversation history.
+// Role follows OpenAI/Vapi convention: "user" | "assistant" | "system"
+model Message {
+  id             String       @id @default(uuid())
+  conversationId String
+  conversation   Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  role           String       // user | assistant | system
+  content        String       @db.Text
+  timestamp      DateTime     @default(now())
+  duration       Float?       // Audio duration in seconds (for voice messages)
+  metadata       Json?        // Extra data: confidence, latency, etc.
+
+  @@map("messages")
+}
+
+model ConversationStage {
+  id             String   @id @default(cuid())
+  conversationId String
+  stageName      String
+  stageIndex     Int
+  enteredAt      DateTime @default(now())
+  exitedAt       DateTime?
+  triggerReason  String?  // "keyword_match" | "llm_eval" | "manual"
+  triggerDetail  String?  // e.g. the matched keyword or LLM reasoning
+  promptSnapshot String?  // the compiled prompt used in this stage
+
+  conversation   Conversation @relation(fields: [conversationId], references: [id])
+}
+
+model OrchestrationSnapshot {
+  id             String   @id @default(cuid())
+  conversationId String   @unique
+  currentStage   String
+  stageIndex     Int
+  collectedData  Json     @default("{}")
+  updatedAt      DateTime @updatedAt
+
+  conversation   Conversation @relation(fields: [conversationId], references: [id])
+}
