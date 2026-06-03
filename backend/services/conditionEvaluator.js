@@ -25,10 +25,65 @@ async function evaluateCondition(condition, transcriptBuffer) {
 
   if (type === 'llm_eval') {
     if (!llmPrompt) return { met: false, reason: 'llm_eval missing llmPrompt' };
+    const Groq = require("groq-sdk");
 
-    // Lazy-load so missing API key doesn't crash the whole server on startup
-    const OpenAI = require('openai');
-    const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+    const groq = new Groq({
+    apiKey: process.env.GROQ_API_KEY,
+    });
+
+    async function evaluateCondition(
+    condition,
+    transcript
+    ){
+
+    const completion =
+    await groq.chat.completions.create({
+
+    model:"llama-3.3-70b-versatile",
+
+    messages:[
+
+    {
+        role:"system",
+        content:
+        `You are a condition evaluator.
+    Return ONLY true or false.`
+    },
+
+    {
+        role:"user",
+        content:
+        `
+    Condition:
+
+    ${condition}
+
+    Transcript:
+
+    ${transcript}
+    `
+    }
+
+    ],
+
+    temperature:0
+
+    });
+
+    const result=
+    completion.choices[0]
+    .message
+    .content
+    .trim()
+    .toLowerCase();
+
+    return result.includes("true");
+
+    }
+
+    module.exports={
+    evaluateCondition
+    };
 
     const recentText = transcriptBuffer
       .slice(-10)
@@ -36,22 +91,47 @@ async function evaluateCondition(condition, transcriptBuffer) {
       .join('\n');
 
     try {
-      const res = await openai.chat.completions.create({
-        model: 'gpt-4o-mini',
-        max_tokens: 60,
-        messages: [
-          {
-            role: 'system',
-            content:
-              'You are a conversation stage evaluator. Answer ONLY with JSON: {"met": true|false, "reason": "..."} — no other text.',
-          },
-          {
-            role: 'user',
-            content: `${llmPrompt}\n\nRecent conversation:\n${recentText}`,
-          },
-        ],
-      });
+      const res = await groq.chat.completions.create({
 
+        model:"llama-3.3-70b-versatile",
+
+        temperature:0,
+
+        max_tokens:60,
+
+        messages:[
+
+        {
+
+        role:"system",
+
+        content:
+        `You are a conversation stage evaluator.
+
+        Return ONLY JSON:
+
+        {
+        "met": true/false,
+        "reason": "short reason"
+        }`
+        },
+
+        {
+
+        role:"user",
+
+        content:
+        `${llmPrompt}
+
+        Recent conversation:
+
+        ${recentText}`
+
+        }
+
+        ]
+
+        });
       const raw = res.choices[0].message.content.trim();
       const parsed = JSON.parse(raw);
       return { met: !!parsed.met, reason: parsed.reason || 'llm_eval' };

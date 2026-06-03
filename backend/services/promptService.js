@@ -58,6 +58,10 @@ const HEADERS = {
   context:      "## Prior Conversation Context",
 };
 
+
+
+
+
 // ─── Internal helpers ─────────────────────────────────────────────────────────
 
 /**
@@ -160,7 +164,28 @@ function buildCompiledPrompt(agent, options = {}) {
   appendSection(parts, HEADERS.memory, agent.memoryInstructions);
 
   // Layer 5 — tool instructions (function/tool usage rules)
-  appendSection(parts, HEADERS.tools, agent.toolInstructions);
+  
+  const mergedToolInstructions = [
+
+    agent.toolInstructions,
+
+    toolInstruction
+
+    ]
+
+    .filter(Boolean)
+
+    .join("\n\n");
+
+    appendSection(
+
+    parts,
+
+    HEADERS.tools,
+
+    mergedToolInstructions
+
+    );
 
   // Layer 6 — context block (from contextService, injected at call time)
   // This is the only runtime layer — all others come from the DB.

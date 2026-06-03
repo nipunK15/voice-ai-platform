@@ -2,7 +2,7 @@
 
 Production-style Voice AI Platform inspired by modern conversational voice infrastructure platforms.
 
-This platform enables users to create configurable voice agents, automatically provision voice assistants, talk with them in realtime, manage conversations, and eventually support advanced orchestration, memory, tools, and prompt layering.
+This platform enables users to create configurable voice agents, automatically provision voice assistants, run realtime conversations, orchestrate multi-stage flows, manage memory, execute tools, and build advanced conversational workflows.
 
 ---
 
@@ -12,30 +12,32 @@ This project is designed as a full Voice AI Platform rather than a simple chatbo
 
 Users can:
 
-* Create Voice Agents
-* Configure prompts, voices, and behavior
-* Automatically provision voice assistants
-* Talk with agents in realtime
-* View conversation history
-* Build advanced orchestration workflows
-* Support future memory, tools, RAG, analytics, and multi-user capabilities
+* Create configurable voice agents
+* Automatically provision assistants
+* Run realtime voice conversations
+* Build multi-stage prompt orchestration workflows
+* Add memory and context injection
+* Execute tools and webhook integrations
+* Store conversations and transcripts
+* Create production-style conversational pipelines
 
 ---
 
-# Current Architecture
+# Tech Stack
 
 ## Frontend
 
 * React
 * Vite
 * React Router
-* Dark themed dashboard UI
+* Dark Dashboard UI
+* React Flow (Prompt Orchestration UI)
 
 ## Backend
 
 * Node.js
 * Express
-* CommonJS architecture
+* CommonJS Architecture
 
 ## Database
 
@@ -51,6 +53,42 @@ Users can:
 
 ---
 
+# Architecture
+
+```text
+Agent Configuration
+
+↓
+
+Prompt Layers
+
+↓
+
+Prompt Orchestration Engine
+
+↓
+
+Memory Layer
+
+↓
+
+Tool Layer
+
+↓
+
+Conversation Context
+
+↓
+
+Runtime Context Injection
+
+↓
+
+Voice Runtime
+```
+
+---
+
 # Project Structure
 
 ```text
@@ -61,8 +99,9 @@ voice-platform/
 │   ├── src/
 │   │
 │   ├── components/
-│   │   ├── Layout.jsx
 │   │   ├── AgentCard.jsx
+│   │   ├── FlowDefinitionEditor.jsx
+│   │   ├── Layout.jsx
 │   │   ├── MessageBubble.jsx
 │   │   └── NotificationToast.jsx
 │   │
@@ -78,17 +117,32 @@ voice-platform/
 ├── backend/
 │
 │   ├── controllers/
-│   ├── services/
 │   ├── routes/
-│   ├── config/
+│   ├── services/
+│   │
+│   │   ├── agentService.js
+│   │   ├── callStateStore.js
+│   │   ├── conditionEvaluator.js
+│   │   ├── contextService.js
+│   │   ├── conversationService.js
+│   │   ├── memoryService.js
+│   │   ├── orchestrationService.js
+│   │   ├── orchestrationSchema.js
+│   │   ├── promptService.js
+│   │   ├── toolExecutor.js
+│   │   ├── toolRegistry.js
+│   │   └── toolRouter.js
+│
 │   └── server.js
 │
-└── prisma/
+├── prisma/
+│
+└── frontend/
 ```
 
 ---
 
-# Current Features
+# Core Features
 
 ## Agent Management
 
@@ -97,71 +151,46 @@ voice-platform/
 * Delete Agents
 * Agent Dashboard
 * Dynamic Routing
-* Agent Detail Pages
+* Voice Provider Selection
 
-## Voice Platform Features
+## Voice Features
 
-* Realtime Voice Conversations
-* Dedicated Voice Call Pages
+* Realtime Voice Calls
 * Live Transcript UI
 * Conversation Completion UI
 * Automatic Assistant Provisioning
 * Assistant Storage
-* Voice Provider Selection
+* Voice Provider Integration
 
-## Supported Voice Providers
+## Prompt Orchestration
 
-* OpenAI Voices
-* ElevenLabs Voices
+* Multi Stage Flows
+* Stage Based Conversation Management
+* Dynamic Stage Advancement
+* Flow Builder UI
+* Runtime Prompt Injection
 
----
+## Memory System
 
-# Current Flow
+* Conversation State Store
+* Transcript Storage
+* Runtime Context Injection
+* Collected Data Persistence During Calls
 
-## Agent Creation Flow
+## Tool Calling
 
-```text
-Create Agent
-
-↓
-
-Backend Creates Voice Assistant Automatically
-
-↓
-
-Assistant ID Returned
-
-↓
-
-Stored In Database
-
-↓
-
-Agent Saved
-```
-
-Users never manually create assistants.
-
-Platform handles provisioning automatically.
+* Tool Registry
+* Tool Router
+* Webhook Execution
+* Structured Tool Payloads
+* Lead Collection Workflow
 
 ---
 
-## Voice Runtime Flow
+# Runtime Flow
 
 ```text
-User Clicks Talk To Agent
-
-↓
-
-Agent Configuration Retrieved
-
-↓
-
-Stored Assistant Loaded
-
-↓
-
-Realtime Voice Session Starts
+User Speaks
 
 ↓
 
@@ -169,7 +198,99 @@ Transcript Generated
 
 ↓
 
-Conversation Ends
+Conversation State Updated
+
+↓
+
+Memory Extraction
+
+↓
+
+Prompt Compilation
+
+↓
+
+Stage Evaluation
+
+↓
+
+Tool Detection
+
+↓
+
+Webhook Execution (Optional)
+
+↓
+
+Assistant Response
+
+↓
+
+Next Stage Evaluation
+```
+
+---
+
+# Example Lead Collection Flow
+
+```text
+User:
+
+"My name is John"
+
+↓
+
+Memory Stores:
+
+name=John
+
+↓
+
+User:
+
+"Company is Google"
+
+↓
+
+Memory Stores:
+
+company=Google
+
+↓
+
+User:
+
+"john at gmail dot com"
+
+↓
+
+Extracted:
+
+john@gmail.com
+
+↓
+
+User:
+
+"Save this lead"
+
+↓
+
+Tool Router Detects Tool
+
+↓
+
+Webhook Executes With:
+
+{
+
+ name:"John",
+
+ company:"Google",
+
+ email:"john@gmail.com"
+
+}
 ```
 
 ---
@@ -179,8 +300,13 @@ Conversation Ends
 ## Backend
 
 ```env
-VAPI_API_KEY=
 DATABASE_URL=
+
+VAPI_API_KEY=
+
+OPENAI_API_KEY=
+
+DEEPGRAM_API_KEY=
 ```
 
 ## Frontend
@@ -201,7 +327,7 @@ git clone <repo-url>
 cd voice-platform
 ```
 
-## Backend
+## Backend Setup
 
 ```bash
 cd backend
@@ -215,13 +341,13 @@ npx prisma migrate dev
 npm run dev
 ```
 
-Backend runs on:
+Backend:
 
 ```text
 localhost:3001
 ```
 
-## Frontend
+## Frontend Setup
 
 ```bash
 cd frontend
@@ -231,7 +357,7 @@ npm install
 npm run dev
 ```
 
-Frontend runs on:
+Frontend:
 
 ```text
 localhost:5173
@@ -239,108 +365,39 @@ localhost:5173
 
 ---
 
-# Current Limitation
+# Current Capabilities
 
-Current architecture primarily supports:
-
-```text
-Single Prompt
-
-↓
-
-Single Assistant Behavior
-
-↓
-
-Realtime Conversation
-```
-
-This is intentionally being evolved.
-
----
-
-# Target Architecture
-
-Goal is to support multi-layer conversational orchestration.
-
-```text
-Agent Config
-
-↓
-
-Prompt Layers
-
-↓
-
-Memory
-
-↓
-
-Tools
-
-↓
-
-Conversation Context
-
-↓
-
-Runtime Context Injection
-
-↓
-
-Voice Runtime
-```
-
-Target capabilities:
-
+* Realtime Voice Conversations
 * Multi Layer Prompting
-* Prompt Chaining
-* Runtime Context Injection
-* Dynamic Behavior Modification
-* Tool Context
-* Conversation Context
-* Memory Layers
-* Better Orchestration
-
----
-
-# Planned Roadmap
-
-## Phase 1
-
-* Conversation Persistence
-* Transcript Storage
-* Conversation History
-
-## Phase 2
-
-* Multi Layer Prompting
-* Memory Systems
-* Context Injection
 * Prompt Orchestration
+* Memory Systems
+* Runtime Context Injection
+* Conversation Context
+* Tool Calling Framework
+* Webhook Integrations
+* Structured Data Extraction
+* Sales Workflow Automation
 
-## Phase 3
+---
 
-* RAG / Knowledge Uploads
-* Analytics
+# Roadmap
+
+## Next Steps
+
+* CRM Integrations
+* RAG / Document Uploads
+* Analytics Dashboard
 * Authentication
 * Multi User Support
-
-## Phase 4
-
 * Production Deployment
-* Scaling
-* Enterprise Features
+* Scaling Infrastructure
 
 ---
 
 # Vision
 
-Build a production-style Voice AI Platform capable of supporting advanced conversational systems similar to modern voice infrastructure platforms.
+Build a production-style Voice AI Platform capable of supporting sophisticated conversational systems with orchestration, memory, tools, context injection, and realtime voice interactions.
 
-The long-term objective is not simply voice chat.
+The objective is not simply voice chat.
 
 The objective is orchestration.
-
-```
-```

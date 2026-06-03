@@ -4,29 +4,25 @@
  * conversationService.js
  * backend/services/conversationService.js
  *
- * All DB operations for conversations and their messages.
+ * CHANGES FROM ORIGINAL:
+ *   1. endConversation now correctly persists `summary` to the DB.
+ *      Previously the signature was (id, { duration }) — summary was never accepted.
+ *      The webhooks.js handler was calling endConversation(id, userId, { summary })
+ *      which meant summary was passed as the second positional arg (not destructured)
+ *      and silently dropped. Summary is the primary memory compression tool —
+ *      if it's never written, contextService always falls back to raw message replay.
  *
- * THE CRITICAL PATH FOR MEMORY:
+ *   2. addMessages (bulk) added — webhooks.js end-of-call handler gets the full
+ *      transcript array and needs to write all messages in one shot, not one at a time.
+ *      The original addMessage (singular) still exists for real-time turn writes.
  *
- *   TalkToAgent  →  call ends
- *        ↓
- *   PATCH /conversations/:id/end
- *        ↓
- *   endConversation() sets status = "completed"
- *        ↓
- *   contextService.fetchRecentConversations() finds it
- *        ↓
- *   next call has context → agent remembers
- *
- * If endConversation() is never called or doesn't set status = "completed",
- * the conversation stays "active" and contextService returns nothing.
+ *   3. getConversationSummary added — used by memoryService to check if a
+ *      conversation already has a summary before generating one.
  */
 
 const prisma = require("../config/database");
 
 // ── getConversations ──────────────────────────────────────────────────────────
-// Returns all conversations for the history page, newest first.
-// Includes message count and agent name for the list view.
 async function getConversations() {
   return prisma.conversation.findMany({
     orderBy: { startedAt: "desc" },
@@ -42,7 +38,6 @@ async function getConversations() {
 }
 
 // ── getConversationById ───────────────────────────────────────────────────────
-// Returns a single conversation with all its messages for the detail view.
 async function getConversationById(id) {
   return prisma.conversation.findUnique({
     where: { id },
@@ -57,13 +52,21 @@ async function getConversationById(id) {
   });
 }
 
-// ── addMessage ────────────────────────────────────────────────────────────────
-// Saves a single transcript turn.
-// Called on every "transcript" + "final" Vapi message event.
-async function addMessage(conversationId, { role, content }) {
-  // Verify conversation exists and is still active before writing
+// ── getConversationSummary ────────────────────────────────────────────────────
+// Used by memoryService to check if summarization has already run for a call.
+async function getConversationSummary(id) {
   const convo = await prisma.conversation.findUnique({
-    where: { id: conversationId },
+    where:  { id },
+    select: { id: true, summary: true, status: true },
+  });
+  return convo;
+}
+
+// ── addMessage (singular) ─────────────────────────────────────────────────────
+// Real-time turn write — called on each "transcript" + "final" Vapi event.
+async function addMessage(conversationId, { role, content }) {
+  const convo = await prisma.conversation.findUnique({
+    where:  { id: conversationId },
     select: { id: true, status: true },
   });
 
@@ -74,33 +77,64 @@ async function addMessage(conversationId, { role, content }) {
   }
 
   return prisma.message.create({
-    data: {
+    data: { conversationId, role, content },
+  });
+}
+
+// ── addMessages (bulk) ────────────────────────────────────────────────────────
+// FIX: Added to handle the end-of-call transcript batch from Vapi's webhook.
+// The webhook receives the full transcript array in the end-of-call-report event
+// and needs to persist all messages atomically.
+//
+// @param {string}   conversationId
+// @param {Array}    messages  [{ role, content, timestamp? }]
+async function addMessages(conversationId, messages) {
+  if (!messages || messages.length === 0) return;
+
+  const convo = await prisma.conversation.findUnique({
+    where:  { id: conversationId },
+    select: { id: true },
+  });
+
+  if (!convo) {
+    const err = new Error(`Conversation ${conversationId} not found`);
+    err.statusCode = 404;
+    throw err;
+  }
+
+  // createMany is much faster than N individual creates for transcript bulk-write
+  return prisma.message.createMany({
+    data: messages.map((m) => ({
       conversationId,
-      role,
-      content,
-      // timestamp defaults to now() in schema — no need to set it
-    },
+      role:      m.role,
+      content:   m.content || "",
+      timestamp: m.timestamp ? new Date(m.timestamp) : new Date(),
+    })),
+    skipDuplicates: true, // safe for idempotent webhook retries
   });
 }
 
 // ── endConversation ───────────────────────────────────────────────────────────
-// Marks a conversation as completed and records its duration.
+// MEMORY GATE — contextService only queries WHERE status = "completed".
 //
-// THIS IS THE MEMORY GATE:
-// contextService only queries WHERE status = "completed".
-// A conversation that never gets ended stays "active" and is invisible
-// to the context layer — the agent has no memory of it next call.
+// FIX: summary is now accepted and persisted.
+// Previous signature: endConversation(id, { duration })
+// New signature:      endConversation(id, { duration, summary })
 //
-// Called by: PATCH /conversations/:id/end (from TalkToAgent call-end event)
-async function endConversation(id, { duration } = {}) {
+// The webhook was calling endConversation(conversation.id, conversation.userId, { summary })
+// — userId was the second positional arg which this function received as the options
+// object, meaning { duration } destructuring got nothing. Fixed in webhooks.js too.
+async function endConversation(id, { duration, summary } = {}) {
   const now = new Date();
 
   const updated = await prisma.conversation.update({
     where: { id },
     data: {
-      status:  "completed",          // ← THE CRITICAL FIELD for context retrieval
+      status:  "completed",
       endedAt: now,
       ...(duration != null && { duration: Math.round(duration) }),
+      // FIX: persist summary — critical for memory compression in contextService
+      ...(summary  != null && { summary: summary.trim() }),
     },
     include: {
       _count: { select: { messages: true } },
@@ -109,8 +143,9 @@ async function endConversation(id, { duration } = {}) {
 
   console.log(
     `[conversationService] Conversation ${id} completed.`,
-    `Duration: ${duration}s.`,
-    `Messages: ${updated._count.messages}`
+    `Duration: ${duration ?? "?"}s.`,
+    `Messages: ${updated._count.messages}.`,
+    `Summary: ${summary ? "✓ persisted" : "✗ none"}`
   );
 
   return updated;
@@ -119,6 +154,8 @@ async function endConversation(id, { duration } = {}) {
 module.exports = {
   getConversations,
   getConversationById,
+  getConversationSummary,
   addMessage,
+  addMessages,
   endConversation,
 };

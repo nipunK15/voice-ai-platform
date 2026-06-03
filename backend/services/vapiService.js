@@ -1,14 +1,28 @@
 // services/vapiService.js
 // Abstraction layer for all Vapi API interactions.
 //
-// ARCHITECTURE DECISION: This is the most critical architectural choice.
-// By isolating ALL Vapi calls behind this service, we achieve provider independence.
-// If we want to support Bland.ai, Retell, or our own voice infra later,
-// we create a new service implementing the same interface and swap it out.
-// Controllers and other services never call Vapi directly.
+// CHANGES FROM ORIGINAL:
+//   1. buildAssistantPayload now uses Groq (not OpenAI) — matches your stated stack
+//   2. MODEL_CONFIG centralised — one place to change provider/model across all methods
+//   3. updateCallAssistant now sends the correct Vapi runtime update shape:
+//      assistantOverrides.model.messages[{role:"system", content}]
+//      NOT assistantOverrides.model.systemPrompt (that field doesn't exist in Vapi's API)
+//   4. buildRuntimeModelOverride extracted as a helper — used by both startCall
+//      (in agentService) and the webhook transcript handler
 
 const axios = require("axios");
 const vapiConfig = require("../config/vapi");
+
+// ─── Central model config ─────────────────────────────────────────────────────
+// ONE place to change provider/model for the entire platform.
+// WHY: Previously "openai" / "gpt-4o-mini" was hardcoded in 3 different places
+// (buildAssistantPayload, agentService.startCall assistantOverrides, webhooks.js).
+// A single constant prevents drift.
+const MODEL_CONFIG = {
+  provider:    process.env.LLM_PROVIDER    || "groq",
+  model:       process.env.LLM_MODEL       || "llama3-70b-8192",
+  temperature: parseFloat(process.env.LLM_TEMPERATURE || "0.7"),
+};
 
 // Create an axios instance pre-configured for Vapi's API
 const vapiClient = axios.create({
@@ -21,45 +35,42 @@ const vapiClient = axios.create({
 });
 
 const vapiService = {
-  // Translate our agent model into Vapi's assistant format and create it
+
+  // ── Model config accessor ─────────────────────────────────────────────────
+  // Exported so agentService can use the same constants when building
+  // assistantOverrides without duplicating values.
+  getModelConfig() {
+    return { ...MODEL_CONFIG };
+  },
+
+  // ── Translate our agent model into Vapi's assistant format ────────────────
   async createVapiAssistant(agent) {
     const config = vapiService.buildAssistantPayload(agent);
-
     const response = await vapiClient.post("/assistant", config);
     return response.data;
   },
 
-  // Update an existing Vapi assistant
   async updateVapiAssistant(vapiAssistantId, agent) {
     const config = vapiService.buildAssistantPayload(agent);
-    const response = await vapiClient.patch(
-      `/assistant/${vapiAssistantId}`,
-      config
-    );
+    const response = await vapiClient.patch(`/assistant/${vapiAssistantId}`, config);
     return response.data;
   },
 
-  // Delete a Vapi assistant
   async deleteVapiAssistant(vapiAssistantId) {
-    const response = await vapiClient.delete(
-      `/assistant/${vapiAssistantId}`
-    );
+    const response = await vapiClient.delete(`/assistant/${vapiAssistantId}`);
     return response.data;
   },
 
-  // Get a specific Vapi assistant
   async getVapiAssistant(vapiAssistantId) {
-    const response = await vapiClient.get(
-      `/assistant/${vapiAssistantId}`
-    );
+    const response = await vapiClient.get(`/assistant/${vapiAssistantId}`);
     return response.data;
   },
 
-  // Build the Vapi assistant payload from our agent model.
-  // This is the "translation layer" between our schema and Vapi's schema.
+  // ── Build the static Vapi assistant payload (used at agent create/update) ─
+  // FIX: provider changed from "openai" to MODEL_CONFIG.provider (Groq)
   buildAssistantPayload(agent) {
     const personalityPrefix =
-      vapiConfig.personalityPrefixes[agent.personality] || "";
+      vapiConfig.personalityPrefixes?.[agent.personality] || "";
 
     const fullSystemPrompt = personalityPrefix
       ? `${personalityPrefix}\n\n${agent.prompt}`
@@ -68,60 +79,94 @@ const vapiService = {
     return {
       name: agent.name,
       model: {
-        provider: "openai",
-        model: "gpt-4o-mini",
-        temperature: agent.temperature,
+        provider:    MODEL_CONFIG.provider,
+        model:       MODEL_CONFIG.model,
+        temperature: agent.temperature ?? MODEL_CONFIG.temperature,
         messages: [
-          {
-            role: "system",
-            content: fullSystemPrompt,
-          },
+          { role: "system", content: fullSystemPrompt },
         ],
       },
       voice: {
         provider: agent.voiceProvider,
-        voiceId: agent.voiceId,
+        voiceId:  agent.voiceId,
       },
       firstMessage: `Hi! I'm ${agent.name}. How can I help you today?`,
       endCallFunctionEnabled: true,
-      recordingEnabled: false, // Default off for privacy
+      recordingEnabled: false,
       transcriber: {
         provider: "deepgram",
-        model: "nova-2",
+        model:    "nova-2",
         language: "en",
       },
     };
   },
 
-  // Build the config object needed by the Vapi Web SDK to start a call.
-  // This is what the frontend's "Talk to Agent" page uses.
+  // ── Build assistantOverrides.model block ──────────────────────────────────
+  // This is the correct shape for BOTH startCall injection AND runtime updates.
+  //
+  // FIX: Previously the webhook handler was sending
+  //   { model: { provider, model, systemPrompt } }
+  // which is NOT a valid Vapi field. The correct shape is:
+  //   { model: { provider, model, messages: [{ role: "system", content }] } }
+  //
+  // This helper is used by:
+  //   - agentService.startCall (assistantOverrides.model)
+  //   - webhooks.js transcript handler (runtime stage update)
+  buildModelOverride(compiledPrompt, temperature) {
+    return {
+      provider:    MODEL_CONFIG.provider,
+      model:       MODEL_CONFIG.model,
+      temperature: temperature ?? MODEL_CONFIG.temperature,
+      messages: [
+        { role: "system", content: compiledPrompt },
+      ],
+    };
+  },
+
+  // ── Build the config for the Vapi Web SDK to start a call ─────────────────
   buildVapiCallConfig(agent) {
     return {
-      // If synced to Vapi, use the Vapi assistant ID directly
       ...(agent.vapiAgentId && { assistantId: agent.vapiAgentId }),
-
-      // If not synced, pass the full config inline (Vapi supports this)
       ...(!agent.vapiAgentId && {
         assistant: vapiService.buildAssistantPayload(agent),
       }),
-
-      // Metadata to track this call in our system
       assistantOverrides: {
         metadata: {
           platformAgentId: agent.id,
-          agentName: agent.name,
+          agentName:       agent.name,
         },
       },
     };
   },
 
-  // Fetch call details from Vapi (for updating conversation records)
+  // ── Runtime prompt update during an active call ───────────────────────────
+  // FIX: Now uses buildModelOverride which sends the correct message array shape.
+  // The original code sent `systemPrompt` as a top-level field on model — that
+  // field does not exist in Vapi's PATCH /call/:id schema and was silently ignored.
+  async updateCallAssistant(callId, compiledPrompt, temperature) {
+    const modelOverride = vapiService.buildModelOverride(compiledPrompt, temperature);
+
+    console.log(
+      "[vapiService.updateCallAssistant] callId:", callId,
+      "provider:", modelOverride.provider,
+      "model:", modelOverride.model,
+      "promptLength:", compiledPrompt.length
+    );
+
+    const response = await vapiClient.patch(`/call/${callId}`, {
+      assistantOverrides: {
+        model: modelOverride,
+      },
+    });
+
+    return response.data;
+  },
+
   async getCallDetails(vapiCallId) {
     const response = await vapiClient.get(`/call/${vapiCallId}`);
     return response.data;
   },
 
-  // List all Vapi assistants (for reconciliation / admin)
   async listAssistants() {
     const response = await vapiClient.get("/assistant");
     return response.data;

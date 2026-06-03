@@ -1,30 +1,19 @@
+// services/contextService.js
+//
+// CHANGES FROM PREVIOUS VERSION:
+//   1. Replaced `new PrismaClient()` with shared `require("../config/database")`.
+//      The old version created its own PrismaClient instance, fragmenting the
+//      connection pool. Under load this caused "too many connections" errors.
+//   2. Added optional callerId parameter to getAgentContext / getRecentContext.
+//      Previously all context was scoped only to agentId — meaning every user
+//      calling the same agent got a context blob mixing all users' conversations.
+//      When callerId is provided, queries filter to that caller's sessions only.
+//   3. fetchRecentConversations now accepts { agentId, callerId } options object.
+//      Backward compatible — callerId is optional.
+
 "use strict";
 
-/**
- * contextService.js
- * backend/services/contextService.js
- *
- * Conversation context retrieval layer.
- *
- * Responsibilities:
- *   1. Fetch recent completed conversations for an agent
- *   2. Retrieve recent messages per conversation
- *   3. Compress and return a prompt-ready context string
- *
- * Schema refs (prisma/schema.prisma):
- *   Conversation → id, agentId, status, startedAt, summary
- *   Message      → id, conversationId, role, content, timestamp
- *
- * Constraints:
- *   - CommonJS only
- *   - Read-only — no writes, no mutations
- *   - No memory layer, no embeddings
- *   - Never throws to caller — safe to call inside start-call route
- */
-
-const { PrismaClient } = require("@prisma/client");
-
-const prisma = new PrismaClient();
+const prisma = require("../config/database");   // shared singleton — no new PrismaClient()
 
 // ─── Tuneable constants ───────────────────────────────────────────────────────
 
@@ -40,7 +29,6 @@ const MAX_MESSAGES_PER_CONVERSATION = 10;
 /**
  * Hard character budget for the final context string.
  * 2 000 chars ≈ ~500 tokens — safe for most prompt windows.
- * Raise carefully; this goes into every start-call payload.
  */
 const MAX_CONTEXT_CHARS = 2000;
 
@@ -48,30 +36,33 @@ const MAX_CONTEXT_CHARS = 2000;
 
 /**
  * Fetch the N most recent COMPLETED conversations for an agent,
- * with their messages pre-loaded in chronological order.
+ * optionally scoped to a specific caller (user).
  *
- * We filter to status "completed" only — active/failed calls
- * are not useful context for a new session.
- *
- * @param {string} agentId
+ * @param {object} opts
+ * @param {string} opts.agentId    Required.
+ * @param {string} [opts.callerId] Optional. When provided, only fetches
+ *                                  conversations where userId === callerId.
+ *                                  This prevents mixing context from different users.
  * @returns {Promise<Array>}
  */
-async function fetchRecentConversations(agentId) {
+async function fetchRecentConversations({ agentId, callerId }) {
+  const where = {
+    agentId,
+    status: "completed",
+    ...(callerId ? { userId: callerId } : {}),
+  };
+
   return prisma.conversation.findMany({
-    where: {
-      agentId,
-      status: "completed",
-    },
+    where,
     orderBy: { startedAt: "desc" },
-    take: MAX_CONVERSATIONS,
+    take:    MAX_CONVERSATIONS,
     include: {
       messages: {
-        // timestamp is the correct field on Message (not createdAt)
         orderBy: { timestamp: "asc" },
-        take: MAX_MESSAGES_PER_CONVERSATION,
+        take:    MAX_MESSAGES_PER_CONVERSATION,
         select: {
-          role: true,
-          content: true,
+          role:      true,
+          content:   true,
           timestamp: true,
         },
       },
@@ -81,28 +72,31 @@ async function fetchRecentConversations(agentId) {
 
 /**
  * Fetch a flat list of the most recent messages for an agent,
- * spanning all conversations, oldest-first.
+ * optionally scoped to a specific caller.
  *
  * Exported for future use (sliding-window summariser, task layer, etc).
- * Not used by the main getAgentContext() path.
  *
  * @param {string} agentId
+ * @param {string} [callerId]
  * @returns {Promise<Array>}
  */
-async function fetchRecentMessages(agentId) {
-  const messages = await prisma.message.findMany({
-    where: {
-      conversation: {
-        agentId,
-        status: "completed",
-      },
+async function fetchRecentMessages(agentId, callerId) {
+  const where = {
+    conversation: {
+      agentId,
+      status: "completed",
+      ...(callerId ? { userId: callerId } : {}),
     },
+  };
+
+  const messages = await prisma.message.findMany({
+    where,
     orderBy: { timestamp: "desc" },
-    take: MAX_CONVERSATIONS * MAX_MESSAGES_PER_CONVERSATION,
+    take:    MAX_CONVERSATIONS * MAX_MESSAGES_PER_CONVERSATION,
     select: {
-      role: true,
-      content: true,
-      timestamp: true,
+      role:           true,
+      content:        true,
+      timestamp:      true,
       conversationId: true,
     },
   });
@@ -117,22 +111,13 @@ async function fetchRecentMessages(agentId) {
  * Serialise a list of conversations into a compact context string.
  *
  * Output shape:
- *
  *   [Session 2024-01-15]
  *   Summary: <summary if present>
  *   user: <message>
  *   assistant: <message>
- *   ...
  *
- *   [Session 2024-01-16]
- *   ...
- *
- * Conversations arrive newest-first from the DB query.
- * We reverse them so the string reads oldest → newest,
- * which is the natural reading order for a language model.
- *
- * If the full string exceeds MAX_CONTEXT_CHARS we drop the oldest
- * sessions from the front — the most recent exchanges are always kept.
+ * Oldest session appears first (natural reading order for LLM).
+ * If full string exceeds MAX_CONTEXT_CHARS, oldest sessions are dropped.
  *
  * @param {Array} conversations  Pre-loaded with .messages[]
  * @returns {string}
@@ -140,7 +125,7 @@ async function fetchRecentMessages(agentId) {
 function compressConversations(conversations) {
   if (!conversations || conversations.length === 0) return "";
 
-  // Reverse so oldest session appears first in the string.
+  // Reverse so oldest session appears first.
   const ordered = [...conversations].reverse();
 
   const blocks = ordered.map((convo) => {
@@ -150,14 +135,13 @@ function compressConversations(conversations) {
 
     const lines = [`[Session ${date}]`];
 
-    // Include the AI-generated summary when present —
-    // it's already compressed and can represent an entire session in one line.
+    // Include AI-generated summary when present —
+    // it's compressed and can represent an entire session in one line.
     if (convo.summary) {
       lines.push(`Summary: ${convo.summary.replace(/\s+/g, " ").trim()}`);
     }
 
-    // Append individual turns. Skip system messages — they add noise,
-    // not signal, when injected back into a future prompt.
+    // Append individual turns. Skip system messages.
     for (const msg of convo.messages || []) {
       if (msg.role === "system") continue;
       const role = msg.role.toLowerCase();
@@ -170,16 +154,11 @@ function compressConversations(conversations) {
 
   let full = blocks.join("\n\n");
 
-  // ── Budget enforcement ────────────────────────────────────────────────────
-  // Drop from the front (oldest sessions) not the back.
-  // Guarantees the model always sees the most recent history.
+  // Drop from the front (oldest sessions) to stay within budget.
   if (full.length > MAX_CONTEXT_CHARS) {
     full = full.slice(full.length - MAX_CONTEXT_CHARS);
-
-    // Avoid starting mid-sentence — skip to the next clean line boundary.
     const boundary = full.indexOf("\n");
     if (boundary !== -1) full = full.slice(boundary + 1);
-
     full = "[...earlier sessions omitted...]\n\n" + full;
   }
 
@@ -189,24 +168,23 @@ function compressConversations(conversations) {
 // ─── Public API ───────────────────────────────────────────────────────────────
 
 /**
- * getAgentContext(agentId)
+ * getAgentContext(agentId, callerId?)
  *
- * Main entry point for the context layer.
+ * Returns a prompt-ready context string for an agent (and optionally a caller).
+ * Returns "" when there is no history.
  *
- * Returns a prompt-ready string describing recent conversation history
- * for the given agent. Returns "" when there is no history.
- *
- * NEVER throws — any internal failure is logged and swallowed.
- * This is intentional: context enrichment must not break a live call.
+ * Never throws — failures are logged and swallowed so a context failure
+ * never breaks a live call.
  *
  * @param {string} agentId
+ * @param {string} [callerId]   Optional. Scopes context to one caller.
  * @returns {Promise<string>}
  */
-async function getAgentContext(agentId) {
+async function getAgentContext(agentId, callerId) {
   if (!agentId) return "";
 
   try {
-    const conversations = await fetchRecentConversations(agentId);
+    const conversations = await fetchRecentConversations({ agentId, callerId });
     if (!conversations.length) return "";
     return compressConversations(conversations);
   } catch (err) {
@@ -216,21 +194,15 @@ async function getAgentContext(agentId) {
 }
 
 /**
- * getRecentContext(agentId)
- *
- * Alias for getAgentContext — used by agentService.startCall().
- * Both names are exported so neither call site needs to change
- * if this service is extended in future layers.
- *
- * @param {string} agentId
- * @returns {Promise<string>}
+ * getRecentContext — alias used by agentService.startCall().
+ * Signature extended to accept optional callerId without breaking existing calls.
  */
 const getRecentContext = getAgentContext;
 
 module.exports = {
-  getAgentContext,           // Primary canonical name
-  getRecentContext,          // Alias — matches agentService import
-  fetchRecentConversations,  // Exported for future task/memory layers
-  fetchRecentMessages,       // Exported for future sliding-window use
-  compressConversations,     // Exported for unit testing
+  getAgentContext,
+  getRecentContext,
+  fetchRecentConversations,
+  fetchRecentMessages,
+  compressConversations,
 };

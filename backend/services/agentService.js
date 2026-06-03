@@ -1,34 +1,25 @@
 // backend/services/agentService.js
 //
-// FIXES IN THIS VERSION:
-//
-// FIX 1 — vapiClient was built at module-load time using process.env.VAPI_API_KEY.
-//   Node evaluates this before dotenv runs in server.js, so the Authorization
-//   header was permanently set to "Bearer undefined".
-//   Solution: getVapiClient() builds the client lazily on first use,
-//   by which time dotenv has already populated process.env.
-//
-// FIX 2 — Added startCall() which creates a Vapi web call token via the
-//   REST API. The frontend uses this token with vapi.start(), which is the
-//   correct v2 flow for authenticated calls.
-//
-// All existing functions (createAgent, getAgents, etc.) are preserved exactly.
-const { getRecentContext } = require("./contextService");
-const { buildCompiledPrompt } = require("./promptService");
+// CHANGES FROM ORIGINAL:
+//   1. MODEL_CONFIG imported from vapiService — single source of truth for provider/model
+//   2. startCall: compiled prompt is ALWAYS built with all layers (personality + memory
+//      + context). When orchestrated, the stage prompt is injected as taskOverride
+//      into buildCompiledPrompt rather than replacing the whole compiled prompt.
+//      Previously: effectivePrompt = rawStagePrompt (all context lost for orchestrated calls)
+//      Now:        effectivePrompt = buildCompiledPrompt(agent, { context, taskOverride: stagePrompt })
+//   3. assistantOverrides.model uses vapiService.buildModelOverride — correct Vapi shape,
+//      correct provider. Previously hardcoded "openai" in two places here.
+//   4. PERSONALITY_PREFIXES removed from this file — was a duplicate of promptService.js.
+//      getPersonalityPrefix from promptService is used instead.
 
+const { getRecentContext }                    = require("./contextService");
+const { buildCompiledPrompt, getPersonalityPrefix } = require("./promptService");
+const vapiService                             = require("./vapiService");
+const axios                                   = require("axios");
+const prisma                                  = require("../config/database");
+const orchestrationService                    = require("./orchestrationService");
 
-const axios = require("axios");
-const prisma = require("../config/database");
-const orchestrationService = require('./orchestrationService');
-
-// ── Lazy Vapi client factory ──────────────────────────────────────────────────
-// DO NOT build axios.create() at the top level of this file.
-// This module is required before dotenv.config() runs in some load orders,
-// which means process.env.VAPI_API_KEY would be undefined at construction time
-// and the Authorization header would be set to "Bearer undefined" forever.
-//
-// Instead, call getVapiClient() inside each function that needs it.
-// The first call after server startup will always have the env var populated.
+// ── Lazy Vapi client ──────────────────────────────────────────────────────────
 let _vapiClient = null;
 
 function getVapiClient() {
@@ -39,7 +30,6 @@ function getVapiClient() {
     err.statusCode = 500;
     throw err;
   }
-  // Build once and cache — the API key doesn't change at runtime
   if (!_vapiClient) {
     _vapiClient = axios.create({
       baseURL: "https://api.vapi.ai",
@@ -50,7 +40,6 @@ function getVapiClient() {
       timeout: 15000,
     });
 
-    // Log Vapi request/response for debugging — remove in production
     _vapiClient.interceptors.request.use((config) => {
       console.log(`[Vapi] → ${config.method.toUpperCase()} ${config.baseURL}${config.url}`);
       return config;
@@ -72,67 +61,35 @@ function getVapiClient() {
   return _vapiClient;
 }
 
-// ── Personality → system prompt prefix ───────────────────────────────────────
-const PERSONALITY_PREFIXES = {
-  professional: "You are a professional and formal AI voice assistant. Speak clearly and concisely.",
-  friendly:     "You are a warm, friendly AI voice assistant. Be conversational and approachable.",
-  casual:       "You are a casual, laid-back AI voice assistant. Use relaxed language.",
-  formal:       "You are a highly formal AI voice assistant. Use precise, structured language.",
-  empathetic:   "You are an empathetic AI voice assistant. Show genuine care and understanding.",
-  technical:    "You are a technical AI voice assistant. Be accurate and detail-oriented.",
-};
-
-// ── Helper: build Vapi assistant payload ─────────────────────────────────────
+// ── Build Vapi payload (for agent create / update in Vapi dashboard) ──────────
+// FIX: uses vapiService.buildModelOverride so provider is consistent
 function buildVapiPayload(data) {
-  const prefix       = PERSONALITY_PREFIXES[data.personality] || "";
+  const prefix       = getPersonalityPrefix(data.personality);
   const systemPrompt = prefix ? `${prefix}\n\n${data.prompt}` : data.prompt;
-  const elevenMap={
 
-    rachel:
+  const { provider, model } = vapiService.getModelConfig();
 
-    "21m00Tcm4TlvDq8ikWAM",
-
-    adam:
-
-    "pNInz6obpgDQGcFmaJgB",
-
-    bella:
-
-    "EXAVITQu4vr4xnSDxMaL"
-
-    }
+  const elevenMap = {
+    rachel: "21m00Tcm4TlvDq8ikWAM",
+    adam:   "pNInz6obpgDQGcFmaJgB",
+    bella:  "EXAVITQu4vr4xnSDxMaL",
+  };
 
   return {
     name:         data.name,
     firstMessage: `Hi, I'm ${data.name}. How can I help you today?`,
     model: {
-      provider:    "openai",
-      model:       "gpt-4o-mini",
+      provider,
+      model,
       temperature: parseFloat(data.temperature),
-      messages: [
-        { role: "system", content: systemPrompt },
-      ],
+      messages: [{ role: "system", content: systemPrompt }],
     },
-    
     voice: {
       provider: data.voiceProvider,
       voiceId:
-
-      data.voiceProvider==="11labs"
-
-      ?
-
-      elevenMap[
-      data.voiceId.toLowerCase()
-        ]
-
-      ||
-
-      data.voiceId
-
-      :
-
-      data.voiceId,
+        data.voiceProvider === "11labs"
+          ? (elevenMap[data.voiceId?.toLowerCase()] || data.voiceId)
+          : data.voiceId,
     },
     transcriber: {
       provider: "deepgram",
@@ -144,15 +101,9 @@ function buildVapiPayload(data) {
 }
 
 // ── createAgent ───────────────────────────────────────────────────────────────
-// Vapi-first atomic flow:
-//   1. POST to Vapi → get assistantId
-//   2. Write DB with vapiAgentId already set
-//   If (1) fails → DB never touched
-//   If (2) fails → cleanup Vapi assistant, re-throw
 async function createAgent(data) {
-  const vapi = getVapiClient(); // throws if VAPI_API_KEY missing
+  const vapi = getVapiClient();
 
-  // Step 1: Create on Vapi
   let vapiAssistant;
   try {
     const payload  = buildVapiPayload(data);
@@ -170,7 +121,6 @@ async function createAgent(data) {
 
   const vapiAgentId = vapiAssistant.id;
 
-  // Step 2: Save to DB with vapiAgentId
   try {
     const agent = await prisma.agent.create({
       data: {
@@ -181,6 +131,7 @@ async function createAgent(data) {
         voiceProvider: data.voiceProvider,
         voiceId:       data.voiceId,
         vapiAgentId,
+        ...(data.flowDefinition ? { flowDefinition: data.flowDefinition } : {}),
         user: {
           connectOrCreate: {
             where:  { email: "demo@voiceplatform.dev" },
@@ -189,14 +140,12 @@ async function createAgent(data) {
         },
       },
     });
-    console.log("[createAgent] Agent saved to DB. ID:", agent.id, "vapiAgentId:", agent.vapiAgentId);
+    console.log("[createAgent] Agent saved. ID:", agent.id, "vapiAgentId:", agent.vapiAgentId);
     return agent;
   } catch (dbErr) {
-    // DB failed — clean up the Vapi assistant
     console.error("[createAgent] DB write failed. Cleaning up Vapi assistant", vapiAgentId);
     try {
       await vapi.delete(`/assistant/${vapiAgentId}`);
-      console.log("[createAgent] Vapi cleanup successful.");
     } catch (cleanupErr) {
       console.error("[createAgent] ORPHANED VAPI ASSISTANT:", vapiAgentId, cleanupErr.message);
     }
@@ -206,27 +155,32 @@ async function createAgent(data) {
 
 // ── getAgents ─────────────────────────────────────────────────────────────────
 async function getAgents() {
-  return await prisma.agent.findMany({
-    orderBy: { createdAt: "desc" },
-  });
+  return prisma.agent.findMany({ orderBy: { createdAt: "desc" } });
 }
 
 // ── getAgentById ──────────────────────────────────────────────────────────────
 async function getAgentById(id) {
-  return await prisma.agent.findUnique({ where: { id } });
+  return prisma.agent.findUnique({ where: { id } });
 }
 
 // ── updateAgent ───────────────────────────────────────────────────────────────
 async function updateAgent(id, data) {
   const updateData = {};
-  if (data.name          !== undefined) updateData.name          = data.name;
-  if (data.prompt        !== undefined) updateData.prompt        = data.prompt;
-  if (data.personality   !== undefined) updateData.personality   = data.personality;
-  if (data.voiceProvider !== undefined) updateData.voiceProvider = data.voiceProvider;
-  if (data.voiceId       !== undefined) updateData.voiceId       = data.voiceId;
-  if (data.temperature   !== undefined) updateData.temperature   = parseFloat(data.temperature);
+  if (data.name            !== undefined) updateData.name            = data.name;
+  if (data.prompt          !== undefined) updateData.prompt          = data.prompt;
+  if (data.personality     !== undefined) updateData.personality     = data.personality;
+  if (data.voiceProvider   !== undefined) updateData.voiceProvider   = data.voiceProvider;
+  if (data.voiceId         !== undefined) updateData.voiceId         = data.voiceId;
+  if (data.temperature     !== undefined) updateData.temperature     = parseFloat(data.temperature);
+  if (data.flowDefinition  !== undefined) updateData.flowDefinition  = data.flowDefinition;
+  // Layered prompt fields
+  if (data.systemPrompt      !== undefined) updateData.systemPrompt      = data.systemPrompt;
+  if (data.conversationPrompt!== undefined) updateData.conversationPrompt= data.conversationPrompt;
+  if (data.taskPrompt        !== undefined) updateData.taskPrompt        = data.taskPrompt;
+  if (data.memoryInstructions!== undefined) updateData.memoryInstructions= data.memoryInstructions;
+  if (data.toolInstructions  !== undefined) updateData.toolInstructions  = data.toolInstructions;
 
-  return await prisma.agent.update({ where: { id }, data: updateData });
+  return prisma.agent.update({ where: { id }, data: updateData });
 }
 
 // ── deleteAgent ───────────────────────────────────────────────────────────────
@@ -245,207 +199,133 @@ async function deleteAgent(id) {
       await vapi.delete(`/assistant/${agent.vapiAgentId}`);
       console.log("[deleteAgent] Vapi assistant deleted:", agent.vapiAgentId);
     } catch (vapiErr) {
-      console.warn("[deleteAgent] Could not delete Vapi assistant:", agent.vapiAgentId, vapiErr.response?.status, vapiErr.message);
+      console.warn("[deleteAgent] Could not delete Vapi assistant:", vapiErr.message);
     }
   }
 
-  return await prisma.agent.delete({ where: { id } });
+  return prisma.agent.delete({ where: { id } });
 }
 
 // ── getVapiConfig ─────────────────────────────────────────────────────────────
 async function getVapiConfig(id) {
   const agent = await prisma.agent.findUnique({ where: { id } });
   if (!agent) {
-    const err     = new Error("Agent not found");
+    const err      = new Error("Agent not found");
     err.statusCode = 404;
     throw err;
   }
 
-  console.log("[getVapiConfig] Agent:", agent.id, "vapiAgentId:", agent.vapiAgentId || "NONE");
-
-  const prefix       = PERSONALITY_PREFIXES[agent.personality] || "";
+  const prefix       = getPersonalityPrefix(agent.personality);
   const systemPrompt = prefix ? `${prefix}\n\n${agent.prompt}` : agent.prompt;
+  const { provider, model } = vapiService.getModelConfig();
 
   if (agent.vapiAgentId) {
-    // Path 1 — registered assistant
     return {
       assistantId:        agent.vapiAgentId,
-      assistantOverrides: {
-        metadata: { platformAgentId: agent.id },
-      },
+      assistantOverrides: { metadata: { platformAgentId: agent.id } },
     };
   }
 
-  // Path 2 — inline fallback for legacy agents
-  console.warn("[getVapiConfig] Agent has no vapiAgentId — using inline config fallback");
   return {
     assistant: {
       name:         agent.name,
       firstMessage: `Hi, I'm ${agent.name}. How can I help you today?`,
       model: {
-        provider:    "openai",
-        model:       "gpt-4o-mini",
+        provider,
+        model,
         temperature: agent.temperature,
-        messages: [{ role: "system", content: systemPrompt }],
+        messages:    [{ role: "system", content: systemPrompt }],
       },
-      voice: {
-        provider: agent.voiceProvider,
-        voiceId:  agent.voiceId,
-      },
-      transcriber: {
-        provider: "deepgram",
-        model:    "nova-2",
-        language: "en",
-      },
+      voice:       { provider: agent.voiceProvider, voiceId: agent.voiceId },
+      transcriber: { provider: "deepgram", model: "nova-2", language: "en" },
       endCallFunctionEnabled: true,
     },
-    assistantOverrides: {
-      metadata: { platformAgentId: agent.id },
-    },
+    assistantOverrides: { metadata: { platformAgentId: agent.id } },
   };
 }
 
 // ── startCall ─────────────────────────────────────────────────────────────────
-// NEW — called by POST /agents/:id/start-call
-//
-// WHY THIS EXISTS:
-// Vapi Web SDK v2 supports two patterns:
-//   A) vapi.start(assistantId)  — simplest, works when assistant is pre-registered
-//   B) vapi.start(assistantConfig) — inline config, no pre-registration needed
-//
-// In both cases, the frontend only needs the assistantId or config object.
-// This endpoint verifies the assistant exists on Vapi before the call starts,
-// returning a clear error if it doesn't (e.g. manually deleted from dashboard).
-//
-// It also creates the Conversation DB record server-side so the frontend
-// doesn't need a separate POST /conversations call.
+// FIX: Stage prompt is now injected as taskOverride into buildCompiledPrompt.
+// Previously: effectivePrompt = rawStagePrompt (no personality, no memory, no context)
+// Now:        effectivePrompt = buildCompiledPrompt(agent, { context, taskOverride: stagePrompt })
+// This means orchestrated calls get full personality + memory + stage goal in one prompt.
 async function startCall(agentId) {
   const agent = await prisma.agent.findUnique({ where: { id: agentId } });
   if (!agent) {
-    const err     = new Error("Agent not found");
+    const err      = new Error("Agent not found");
     err.statusCode = 404;
     throw err;
   }
 
   if (!agent.vapiAgentId) {
-    const err     = new Error("This agent has no Vapi assistant ID. Delete it and create a new one.");
+    const err      = new Error("This agent has no Vapi assistant ID. Delete it and create a new one.");
     err.statusCode = 400;
     throw err;
   }
 
-  // Verify the assistant still exists on Vapi.
-  // getRecentContext is called AFTER this block — it must never be inside
-  // the Vapi try/catch or a context failure would surface as a false 502.
-  let vapiAssistant;
+  // Verify Vapi assistant still exists
   try {
-    const vapi    = getVapiClient();
-    const res     = await vapi.get(`/assistant/${agent.vapiAgentId}`);
-    vapiAssistant = res.data;
-    console.log("[startCall] Vapi assistant verified:", vapiAssistant.id);
+    const vapi = getVapiClient();
+    await vapi.get(`/assistant/${agent.vapiAgentId}`);
+    console.log("[startCall] Vapi assistant verified:", agent.vapiAgentId);
   } catch (vapiErr) {
     const status = vapiErr.response?.status;
     if (status === 404) {
-      // Assistant was deleted from Vapi dashboard — clear our stale ID
-      await prisma.agent.update({
-        where: { id: agentId },
-        data:  { vapiAgentId: null },
-      });
-      const err     = new Error("Vapi assistant no longer exists. Delete this agent and create a new one.");
+      await prisma.agent.update({ where: { id: agentId }, data: { vapiAgentId: null } });
+      const err      = new Error("Vapi assistant no longer exists. Delete this agent and create a new one.");
       err.statusCode = 404;
       throw err;
     }
-    const err = new Error(`Could not verify Vapi assistant: ${vapiErr.message}`);
+    const err      = new Error(`Could not verify Vapi assistant: ${vapiErr.message}`);
     err.statusCode = 502;
     throw err;
   }
-
-  // Fetch recent context AFTER Vapi verification succeeds.
-  // getRecentContext never throws — returns "" on any failure or no history.
-  const recentContext = await getRecentContext(agent.id);
-  console.log("[startCall] Context length:", recentContext.length);
-
-  // Get or create demo user for conversation record
-  const user = await prisma.user.upsert({
+  const user= await prisma.user.upsert({
     where:  { email: "demo@voiceplatform.dev" },
     update: {},
     create: { email: "demo@voiceplatform.dev", name: "Demo Developer" },
   });
 
-  // Create Conversation record — this is the DB record for this call session
-  const conversation = await prisma.conversation.create({
-    data: {
-      agentId:    agent.id,
-      userId:     user.id,
-      status:     "active",
-    },
-  });
+  // Retrieve memory context (never throws — returns "" on failure)
+  const recentContext = await getRecentContext(agent.id, user.id);
+  console.log("[startCall] Context chars:", recentContext.length);
 
+   
+
+  const conversation = await prisma.conversation.create({
+    data: { agentId: agent.id, userId: user.id, status: "active" },
+  });
   console.log("[startCall] Conversation created:", conversation.id);
 
-  const orchResult =
-  await orchestrationService.startOrchestration(
-    conversation.id,
-    agent
+  // Start orchestration (returns stagePrompt for stage 0, or orchestrated:false)
+  const orchResult = await orchestrationService.startOrchestration(conversation.id, agent);
+
+  // ── Compile the final prompt ───────────────────────────────────────────────
+  // FIX: When orchestrated, use stagePrompt as taskOverride so all other layers
+  // (personality, system, conversation, memory, context) are still included.
+  // This was the core bug: orchestrated calls got only the raw stage string.
+  const compiledPrompt = buildCompiledPrompt(agent, {
+    context:      recentContext,
+    taskOverride: orchResult.orchestrated ? orchResult.stagePrompt : null,
+  });
+
+  console.log(
+    "[startCall] Prompt compiled.",
+    "Orchestrated:", orchResult.orchestrated,
+    "Stage:", orchResult.currentStage || "none",
+    "TotalLength:", compiledPrompt.length
   );
 
-  // Build the compiled prompt via promptService.
-  // buildCompiledPrompt handles both legacy agents (only agent.prompt set)
-  // and new layered agents (systemPrompt, conversationPrompt, etc.) with
-  // identical output for existing agents — backward compatibility guaranteed.
-  const compiledPrompt = buildCompiledPrompt(agent, { context: recentContext });
-
-  
-
-  // Only set model.messages when we have something to inject —
-  // if compiledPrompt equals agent.prompt verbatim, Vapi already has it
-  // stored on the assistant, so we can skip the override entirely.
-  // We always inject when recentContext is present (context changes per call).
-  // Vapi assistantOverrides.model.systemPrompt is the correct field for
-  // overriding the system prompt per-call. The model.messages array only
-  // accepts "user" and "assistant" roles — sending role:"system" there
-  // causes Vapi to reject the request with a 400.
-  // When overriding model fields, Vapi requires `provider` to be present —
-  // it cannot be a partial object. We mirror the provider already stored
-  // on the Vapi assistant (openai / gpt-4o-mini) so nothing else changes.
-  if (recentContext || compiledPrompt !== agent.prompt) {
-    assistantOverrides.model = {
-      provider:     "openai",
-      model:        "gpt-4o-mini",
-      systemPrompt: compiledPrompt,
-    };
-    console.log("[startCall] Compiled prompt injected. Length:", compiledPrompt.length);
-  }
-
+  // ── Build assistantOverrides ───────────────────────────────────────────────
+  // FIX: uses vapiService.buildModelOverride — correct Vapi shape, correct provider
   const assistantOverrides = {
-
-  metadata:{
-    platformAgentId:agent.id,
-    platformConversationId:conversation.id,
-
-    // webhook orchestration needs this
-
-    conversationId:conversation.id
-    }
-
+    metadata: {
+      platformAgentId:        agent.id,
+      platformConversationId: conversation.id,
+      conversationId:         conversation.id,
+    },
+    model: vapiService.buildModelOverride(compiledPrompt, agent.temperature),
   };
-
-  if (orchResult.orchestrated) {
-
-    assistantOverrides.model =
-    assistantOverrides.model || {};
-
-    assistantOverrides.model.messages = [
-
-    {
-        role:"system",
-        content:orchResult.stagePrompt
-    }
-
-    ];
-
-    }
-
-
 
   return {
     assistantId:    agent.vapiAgentId,
@@ -461,5 +341,5 @@ module.exports = {
   updateAgent,
   deleteAgent,
   getVapiConfig,
-  startCall,       // NEW
+  startCall,
 };

@@ -2,44 +2,26 @@
 //
 // FIXES IN THIS VERSION:
 //
-// FIX 1 — vapi.start() argument shape (ROOT CAUSE of "Something went wrong")
-//   BEFORE: vapi.start(vapiCallConfig)
-//     where vapiCallConfig = { assistantId: "...", assistantOverrides: {...} }
-//     Vapi SDK v2 does NOT accept a plain object with these keys directly.
-//     It expects either a string assistantId OR a structured params object.
+// FIX 1 — call?.id was undefined (call was never defined anywhere in the component).
+//   Vapi SDK v2 does not expose a `call` object on the instance. The active call ID
+//   is available via the "call-start" event payload. We capture it in callIdRef.
+//   callId is now correctly sent to the backend on every message save, enabling
+//   vapiService.updateCallAssistant() to target the live call when a stage advances.
 //
-//   AFTER:  vapi.start(assistantId, assistantOverrides)
-//     The backend POST /agents/:id/start-call now returns:
-//       { assistantId, conversationId, assistantOverrides }
-//     We call: vapi.start(result.assistantId, result.assistantOverrides)
-//     This is the correct Vapi v2 Web SDK call signature.
+// FIX 2 — Vapi transcript event shape guard.
+//   Vapi SDK versions differ on whether transcriptType is always present.
+//   Added a fallback: accept the message if transcriptType is "final" OR if
+//   transcriptType is absent but message.transcript is a non-empty string.
+//   This prevents "0 messages" when running older/newer SDK builds.
 //
-// FIX 2 — Use POST /agents/:id/start-call instead of GET /agents/:id/vapi-config
-//   The start-call endpoint: verifies the assistant still exists on Vapi,
-//   creates the conversation DB record server-side, and returns the
-//   conversationId so we don't need a separate POST /conversations call.
-//
-// FIX 3 — vapiRef cleanup on re-call
-//   If the user clicks "Start New Call" after a previous call ended,
-//   the old Vapi instance is still in vapiRef. We now explicitly null it
-//   and create a fresh instance each time to avoid listener accumulation.
-//
-// FIX 4 — removeAllListeners() guard
-//   Vapi SDK v2 may not expose removeAllListeners(). We now guard this
-//   call so unmount doesn't throw a TypeError.
-//
-// FIX 5 — conversationId closure problem in call-end handler
-//   call-end fires asynchronously after the state update from call-start.
-//   Using a ref (conversationIdRef) instead of state ensures call-end
-//   always sees the latest conversationId, not a stale closure value.
+// All other logic is preserved exactly.
 
 import { useEffect, useRef, useState, useCallback } from "react";
 import { useParams, useNavigate } from "react-router-dom";
 import axios from "axios";
 import Vapi from "@vapi-ai/web";
 
-const API = "http://localhost:3001/api";
-
+const API            = "http://localhost:3001/api";
 const VAPI_PUBLIC_KEY = import.meta.env.VITE_VAPI_PUBLIC_KEY || "";
 
 const STATUS = {
@@ -67,10 +49,10 @@ export default function TalkToAgent() {
   const vapiRef           = useRef(null);
   const callStartTime     = useRef(null);
   const durationTimer     = useRef(null);
-  // FIX 5: use a ref for conversationId so async handlers always see current value
   const conversationIdRef = useRef(null);
+  // FIX 1: capture the live Vapi call ID from the call-start event
+  const callIdRef         = useRef(null);
 
-  // ── Load agent ───────────────────────────────────────────────────────────────
   useEffect(() => {
     loadAgent();
     return () => {
@@ -84,7 +66,6 @@ export default function TalkToAgent() {
       const res = await axios.get(`${API}/agents/${id}`);
       setAgent(res.data);
 
-      // Warn in UI if agent was created before auto-Vapi-sync was added
       if (!res.data.vapiAgentId) {
         setErrorMessage(
           "This agent has no Vapi assistant linked. " +
@@ -103,14 +84,10 @@ export default function TalkToAgent() {
     }
   }
 
-  // ── FIX 4: safe Vapi stop that won't throw if instance is null or missing methods
   function safeStopVapi() {
     if (!vapiRef.current) return;
+    try { vapiRef.current.stop(); } catch (_) {}
     try {
-      vapiRef.current.stop();
-    } catch (_) {}
-    try {
-      // removeAllListeners exists in some SDK versions, not all
       if (typeof vapiRef.current.removeAllListeners === "function") {
         vapiRef.current.removeAllListeners();
       }
@@ -118,8 +95,6 @@ export default function TalkToAgent() {
     vapiRef.current = null;
   }
 
-  // ── Init Vapi instance ────────────────────────────────────────────────────────
-  // FIX 3: always creates a fresh instance, cleaning up any previous one first
   function initVapi() {
     if (!VAPI_PUBLIC_KEY) {
       setErrorMessage(
@@ -130,15 +105,21 @@ export default function TalkToAgent() {
       return null;
     }
 
-    // Clean up previous instance before creating a new one
     safeStopVapi();
 
-    console.log("[TalkToAgent] Initialising Vapi SDK with public key:", VAPI_PUBLIC_KEY.slice(0, 8) + "...");
+    console.log("[TalkToAgent] Initialising Vapi SDK:", VAPI_PUBLIC_KEY.slice(0, 8) + "...");
     const vapi = new Vapi(VAPI_PUBLIC_KEY);
     vapiRef.current = vapi;
 
-    vapi.on("call-start", async () => {
-      console.log("[Vapi event] call-start");
+    // FIX 1: call-start payload contains the active call object with its ID.
+    // Capture it in callIdRef so every message save can include the callId.
+    vapi.on("call-start", async (callObject) => {
+      console.log("[Vapi event] call-start", callObject);
+      // SDK v2 passes the call object as the event payload
+      if (callObject?.id) {
+        callIdRef.current = callObject.id;
+        console.log("[TalkToAgent] Live call ID captured:", callObject.id);
+      }
       setCallStatus(STATUS.ACTIVE);
       callStartTime.current = Date.now();
 
@@ -158,7 +139,6 @@ export default function TalkToAgent() {
         : 0;
       setCallDuration(duration);
 
-      // FIX 5: read from ref, not state — avoids stale closure
       const convId = conversationIdRef.current;
       if (convId) {
         console.log("[TalkToAgent] Ending conversation record:", convId);
@@ -168,28 +148,100 @@ export default function TalkToAgent() {
           console.warn("[TalkToAgent] Could not end conversation:", e.message);
         }
       }
+
+      // Clear call ID after call ends
+      callIdRef.current = null;
     });
 
     vapi.on("message", (message) => {
-      // Debug: log every message type to help diagnose issues
       console.log("[Vapi event] message:", message.type, message.transcriptType || "");
 
-      if (message.type === "transcript" && message.transcriptType === "final") {
+      // FIX 2: guard against SDK version differences in transcriptType presence.
+      // Accept the turn if:
+      //   a) transcriptType is explicitly "final" (standard), OR
+      //   b) transcriptType is absent/undefined but transcript is a non-empty string
+      //      (some SDK builds omit transcriptType on final events)
+      const isFinalTranscript =
+        message.type === "transcript" &&
+        (
+          message.transcriptType === "final" ||
+          (!message.transcriptType && typeof message.transcript === "string" && message.transcript.trim().length > 0)
+        );
+
+      if (isFinalTranscript) {
+        console.log("[TRANSCRIPT EVENT]", message.role, message.transcript);
+
         const entry = {
           role:    message.role,
           content: message.transcript,
           ts:      Date.now(),
+          // FIX 1: use callIdRef instead of the undefined `call?.id`
+          callId:  callIdRef.current,
         };
+
         setTranscript((prev) => [...prev, entry]);
 
         const convId = conversationIdRef.current;
         if (convId) {
           axios
-            .post(`${API}/conversations/${convId}/messages`, {
-              role:    entry.role === "bot" ? "assistant" : entry.role,
-              content: entry.content,
+            .post(
+            `${API}/conversations/${convId}/messages`,
+            {
+            role:
+            entry.role==="bot"
+            ? "assistant"
+            : entry.role,
+
+            content:
+            entry.content,
+
+            callId:
+            entry.callId
+            }
+            )
+            .then(async(res)=>{
+
+            console.log(
+            "[messages response]",
+            res.data
+            );
+
+            if(
+            res.data.toolExecuted ||
+            res.data.stopFurtherProcessing
+            ){
+
+            console.log(
+                "[TalkToAgent] Tool executed. Stopping Vapi continuation."
+            );
+
+            if(
+                vapiRef.current
+            ){
+
+                try{
+
+                await vapiRef.current.stop();
+
+                }catch(err){
+
+                console.log(err);
+
+                }
+
+            }
+
+            return;
+
+            }
+
             })
-            .catch((e) => console.warn("[TalkToAgent] Message save failed:", e.message));
+            .catch((e)=>
+            console.warn(
+            "[TalkToAgent] Message save failed:",
+            e.message
+            )
+            );
         }
       }
 
@@ -206,18 +258,11 @@ export default function TalkToAgent() {
       console.error("[Vapi event] error:", err);
       clearInterval(durationTimer.current);
 
-      // err can be a plain object {message, error, statusCode} from Vapi's
-      // REST layer, or an Error instance, or have nested objects.
-      // We must always resolve to a string — rendering an object crashes React.
       const extractMessage = (e) => {
         if (!e) return null;
-        // Vapi v2 shape: { error: { message: "..." } }
         if (typeof e?.error?.message === "string") return e.error.message;
-        // Vapi v2 shape: { error: "string" }
         if (typeof e?.error === "string") return e.error;
-        // Standard Error or { message: "string" }
         if (typeof e?.message === "string") return e.message;
-        // Last resort — stringify the whole thing so React can render it
         try { return JSON.stringify(e); } catch (_) { return null; }
       };
 
@@ -231,7 +276,6 @@ export default function TalkToAgent() {
     return vapi;
   }
 
-  // ── Start Call ────────────────────────────────────────────────────────────────
   const handleStartCall = useCallback(async () => {
     if (!agent) return;
 
@@ -240,11 +284,9 @@ export default function TalkToAgent() {
     setCallDuration(0);
     setErrorMessage("");
     conversationIdRef.current = null;
+    callIdRef.current         = null;
 
     try {
-      // FIX 1 + 2: use POST /agents/:id/start-call instead of GET /vapi-config
-      // This endpoint: verifies assistant exists, creates conversation record,
-      // returns { assistantId, conversationId, assistantOverrides }
       console.log("[TalkToAgent] Calling start-call endpoint for agent:", id);
       const res    = await axios.post(`${API}/agents/${id}/start-call`);
       const result = res.data;
@@ -254,25 +296,13 @@ export default function TalkToAgent() {
         conversationId: result.conversationId,
       });
 
-      // Store conversationId in ref immediately so call-end handler sees it
       conversationIdRef.current = result.conversationId;
 
-      // Init fresh Vapi instance with all listeners attached
       const vapi = initVapi();
       if (!vapi) return;
 
-      // FIX 1 — CORRECT vapi.start() call for SDK v2:
-      //   vapi.start(assistantId)
-      //   — OR —
-      //   vapi.start(assistantId, assistantOverrides)
-      //
-      // DO NOT pass the whole response object.
-      // The assistantId must be a plain string.
       console.log("[TalkToAgent] Calling vapi.start() with assistantId:", result.assistantId);
       await vapi.start(result.assistantId, result.assistantOverrides);
-
-      // STATUS.ACTIVE is set by the "call-start" event handler above.
-      // If vapi.start() resolves but call-start never fires, the error handler fires instead.
 
     } catch (err) {
       console.error("[TalkToAgent] handleStartCall failed:", err);
@@ -285,7 +315,6 @@ export default function TalkToAgent() {
     }
   }, [agent, id]);
 
-  // ── End Call ──────────────────────────────────────────────────────────────────
   const handleEndCall = useCallback(() => {
     if (!vapiRef.current) return;
     console.log("[TalkToAgent] User ended call.");
@@ -293,7 +322,6 @@ export default function TalkToAgent() {
     vapiRef.current.stop();
   }, []);
 
-  // ── Mute toggle ───────────────────────────────────────────────────────────────
   const handleToggleMute = useCallback(() => {
     if (!vapiRef.current) return;
     const next = !isMuted;
@@ -302,14 +330,12 @@ export default function TalkToAgent() {
     console.log("[TalkToAgent] Mute:", next);
   }, [isMuted]);
 
-  // ── Helpers ───────────────────────────────────────────────────────────────────
   function formatDuration(secs) {
     const m = Math.floor(secs / 60).toString().padStart(2, "0");
     const s = (secs % 60).toString().padStart(2, "0");
     return `${m}:${s}`;
   }
 
-  // ── Render: Loading ───────────────────────────────────────────────────────────
   if (callStatus === STATUS.LOADING) {
     return (
       <div style={styles.centered}>
@@ -318,7 +344,6 @@ export default function TalkToAgent() {
     );
   }
 
-  // ── Render: Error ─────────────────────────────────────────────────────────────
   if (callStatus === STATUS.ERROR) {
     return (
       <div style={styles.centered}>
@@ -339,7 +364,6 @@ export default function TalkToAgent() {
             </button>
           </div>
 
-          {/* Debug info — helps developers fix config issues */}
           <div style={styles.debugBox}>
             <p style={styles.debugTitle}>Debug Info</p>
             <p style={styles.debugLine}>Agent ID: {id}</p>
@@ -358,12 +382,10 @@ export default function TalkToAgent() {
   const isConnecting = callStatus === STATUS.CONNECTING || callStatus === STATUS.ENDING;
   const isEnded      = callStatus === STATUS.ENDED;
 
-  // ── Render: Main ──────────────────────────────────────────────────────────────
   return (
     <div style={styles.page}>
       <div style={styles.card}>
 
-        {/* Header */}
         <div style={styles.header}>
           <button onClick={() => navigate(`/agents/${id}`)} style={styles.backBtn}>
             ← Back
@@ -371,7 +393,6 @@ export default function TalkToAgent() {
           <span style={styles.headerLabel}>Voice Call</span>
         </div>
 
-        {/* Agent Info */}
         <div style={styles.agentInfo}>
           <div style={styles.agentAvatar}>
             {agent?.name?.charAt(0)?.toUpperCase() || "?"}
@@ -389,7 +410,6 @@ export default function TalkToAgent() {
           </div>
         </div>
 
-        {/* Status row */}
         <div style={styles.statusRow}>
           <StatusDot status={callStatus} />
           <span style={styles.statusText}>
@@ -404,10 +424,8 @@ export default function TalkToAgent() {
           )}
         </div>
 
-        {/* Waveform */}
         {isLive && <Waveform level={volumeLevel} />}
 
-        {/* Controls */}
         <div style={styles.controls}>
           {(callStatus === STATUS.READY || isEnded) && (
             <button onClick={handleStartCall} style={btnStyle("#10b981", false, "180px")}>
@@ -431,7 +449,6 @@ export default function TalkToAgent() {
           )}
         </div>
 
-        {/* Transcript */}
         {transcript.length > 0 && (
           <div style={styles.transcriptSection}>
             <p style={styles.transcriptTitle}>
@@ -445,7 +462,6 @@ export default function TalkToAgent() {
           </div>
         )}
 
-        {/* Post-call summary */}
         {isEnded && (
           <div style={styles.summary}>
             <p style={styles.summaryTitle}>✓ Call Complete</p>
@@ -461,7 +477,6 @@ export default function TalkToAgent() {
           </div>
         )}
 
-        {/* No public key warning (READY state) */}
         {callStatus === STATUS.READY && !VAPI_PUBLIC_KEY && (
           <div style={styles.warningBox}>
             <strong>⚠️ VITE_VAPI_PUBLIC_KEY not set</strong>
@@ -480,7 +495,7 @@ export default function TalkToAgent() {
   );
 }
 
-// ── Sub-components ─────────────────────────────────────────────────────────────
+// ── Sub-components ────────────────────────────────────────────────────────────
 
 function StatusDot({ status }) {
   const colors = {
@@ -543,7 +558,7 @@ function TranscriptLine({ entry }) {
   );
 }
 
-// ── Styles ─────────────────────────────────────────────────────────────────────
+// ── Styles ────────────────────────────────────────────────────────────────────
 
 function btnStyle(bg, disabled = false, width = "auto") {
   return {

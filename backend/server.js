@@ -21,9 +21,53 @@ const prisma = require("./config/database");
 const app = express();
 const PORT = process.env.PORT || 3001;
 
+const {
+ registerTool
+}=require(
+ "./services/toolRegistry"
+);
+
+registerTool({
+
+ name:"send_lead",
+
+ type:"webhook",
+
+ method:"POST",
+
+ url:"http://localhost:3001/api/lead"
+
+});
+registerTool({
+
+ name:
+ "lookup_customer",
+
+ type:
+ "webhook",
+
+ method:
+ "POST",
+
+ url:
+ "https://your-api.com/customer"
+
+});
+
 // ─── Middleware ────────────────────────────────────────────────────────────────
 
 // CORS — allow frontend to talk to backend
+app.post("/api/lead",(req,res)=>{
+
+ console.log(req.body);
+
+ res.json({
+   
+   received:req.body
+ });
+
+});
+
 app.use(
   cors({
     origin: [
